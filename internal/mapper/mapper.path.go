@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/GoMudEngine/GoMud/internal/rooms"
@@ -13,10 +14,63 @@ import (
 )
 
 var (
-	ErrPathNotFound  = errors.New(`path not found`)
-	ErrPathDestMatch = errors.New(`path destination is same as source`)
-	pathCache, _     = lru.New[pathCacheKey, pathCacheValue](128)
+	ErrPathNotFound    = errors.New(`path not found`)
+	ErrPathDestMatch   = errors.New(`path destination is same as source`)
+	ErrPathBlocked     = errors.New(`path blocked by constraints`)
+	ErrPathSearchLimit = errors.New(`path search limit exceeded`)
+	pathCache, _       = lru.New[pathCacheKey, pathCacheValue](128)
 )
+
+// RoomExit identifies a single named exit of a specific room.
+type RoomExit struct {
+	RoomId   int
+	ExitName string
+}
+
+// PathConstraints describes rooms and exits a path query must avoid.
+// The zero value imposes no constraints.
+type PathConstraints struct {
+	BlockedRooms map[int]struct{}
+	BlockedExits map[RoomExit]struct{}
+}
+
+// BlockRoom adds a room the path may not enter, and returns the
+// constraints for chaining.
+func (c *PathConstraints) BlockRoom(roomId int) *PathConstraints {
+	if c.BlockedRooms == nil {
+		c.BlockedRooms = make(map[int]struct{})
+	}
+	c.BlockedRooms[roomId] = struct{}{}
+	return c
+}
+
+// BlockExit adds a single named exit of a room the path may not take,
+// and returns the constraints for chaining.
+func (c *PathConstraints) BlockExit(roomId int, exitName string) *PathConstraints {
+	if c.BlockedExits == nil {
+		c.BlockedExits = make(map[RoomExit]struct{})
+	}
+	c.BlockedExits[RoomExit{RoomId: roomId, ExitName: exitName}] = struct{}{}
+	return c
+}
+
+// blocksRoom reports whether a room is off-limits. Nil-safe.
+func (c *PathConstraints) blocksRoom(roomId int) bool {
+	if c == nil {
+		return false
+	}
+	_, ok := c.BlockedRooms[roomId]
+	return ok
+}
+
+// blocksExit reports whether a specific exit of a room is off-limits. Nil-safe.
+func (c *PathConstraints) blocksExit(roomId int, exitName string) bool {
+	if c == nil {
+		return false
+	}
+	_, ok := c.BlockedExits[RoomExit{RoomId: roomId, ExitName: exitName}]
+	return ok
+}
 
 type pathCacheKey struct {
 	startRoomId int
@@ -62,8 +116,14 @@ type nodeRecord struct {
 
 type priorityQueue []*nodeRecord
 
-func (pq priorityQueue) Len() int           { return len(pq) }
-func (pq priorityQueue) Less(i, j int) bool { return pq[i].fScore < pq[j].fScore }
+func (pq priorityQueue) Len() int { return len(pq) }
+func (pq priorityQueue) Less(i, j int) bool {
+	// Stable tie-break on roomId so equal-cost routes resolve deterministically.
+	if pq[i].fScore == pq[j].fScore {
+		return pq[i].roomId < pq[j].roomId
+	}
+	return pq[i].fScore < pq[j].fScore
+}
 func (pq priorityQueue) Swap(i, j int) {
 	pq[i], pq[j] = pq[j], pq[i]
 	pq[i].index = i
@@ -100,6 +160,13 @@ func (r *mapper) heuristic(a, b int) float64 {
 
 // FindPath returns the sequence of ExitName/RoomID steps from startRoom to goalRoom.
 func (r *mapper) findPath(startRoom, goalRoom int) ([]pathStep, error) {
+	return r.findPathConstrained(startRoom, goalRoom, nil)
+}
+
+// findPathConstrained is findPath with optional constraints: blocked rooms may
+// not be entered and blocked exits may not be taken. A nil constraints pointer
+// behaves exactly like findPath.
+func (r *mapper) findPathConstrained(startRoom, goalRoom int, constraints *PathConstraints) ([]pathStep, error) {
 
 	if startRoom == goalRoom {
 		return nil, ErrPathDestMatch
@@ -111,6 +178,11 @@ func (r *mapper) findPath(startRoom, goalRoom int) ([]pathStep, error) {
 	}
 	if _, ok := r.crawledRooms[goalRoom]; !ok {
 		return nil, ErrRoomNotFound
+	}
+
+	// A blocked start or goal can never yield a route.
+	if constraints.blocksRoom(startRoom) || constraints.blocksRoom(goalRoom) {
+		return nil, ErrPathBlocked
 	}
 
 	// cameFrom holds, for each room, how we got there.
@@ -132,9 +204,21 @@ func (r *mapper) findPath(startRoom, goalRoom int) ([]pathStep, error) {
 	heap.Push(&openSet, &nodeRecord{roomId: startRoom, fScore: fScore[startRoom]})
 	inOpen := map[int]*nodeRecord{startRoom: openSet[0]}
 
+	// Hard bound on expansions. Costs are uniform positive integers and every
+	// (re)push of a room strictly lowers its integer gScore, so a room with n
+	// rooms in the graph can be expanded well under n*n times. The cap only
+	// guards against pathological states; it never triggers on a healthy graph.
+	maxExpansions := len(r.crawledRooms)*len(r.crawledRooms) + len(r.crawledRooms) + 1
+	expansions := 0
+
 	for openSet.Len() > 0 {
 		current := heap.Pop(&openSet).(*nodeRecord)
 		delete(inOpen, current.roomId)
+
+		expansions++
+		if expansions > maxExpansions {
+			return nil, ErrPathSearchLimit
+		}
 
 		// reached goal!
 		if current.roomId == goalRoom {
@@ -164,10 +248,30 @@ func (r *mapper) findPath(startRoom, goalRoom int) ([]pathStep, error) {
 			return path, nil
 		}
 
-		// expand neighbors
+		// expand neighbors in sorted exit order so equal-cost routes are
+		// explored (and selected) deterministically.
 		node := r.crawledRooms[current.roomId]
-		for exitName, exitInfo := range node.Exits {
+		exitNames := make([]string, 0, len(node.Exits))
+		for exitName := range node.Exits {
+			exitNames = append(exitNames, exitName)
+		}
+		sort.Strings(exitNames)
+
+		for _, exitName := range exitNames {
+			exitInfo := node.Exits[exitName]
 			neighbor := exitInfo.RoomId
+
+			if constraints.blocksExit(current.roomId, exitName) {
+				continue
+			}
+			if constraints.blocksRoom(neighbor) {
+				continue
+			}
+			// Skip dangling exits that point at rooms the mapper doesn't know.
+			if _, ok := r.crawledRooms[neighbor]; !ok {
+				continue
+			}
+
 			tentativeG := gScore[current.roomId] + 1 // uniform cost
 
 			if tentativeG < gScore[neighbor] {
@@ -214,6 +318,44 @@ func GetPath(startRoomId int, endRoomId ...int) ([]pathStep, error) {
 		return []pathStep{}, fmt.Errorf("%d => %d (mapper not fond): %w", startRoomId, endRoomId, ErrPathNotFound)
 	}
 
+	return getPath(m, startRoomId, nil, endRoomId...)
+}
+
+// GetPathConstrained behaves like GetPath, but the route may not enter any
+// blocked room nor take any blocked exit named in constraints. Constrained
+// queries never read from or write to the shared path cache, so they neither
+// reuse unconstrained results nor pollute later unconstrained queries.
+func GetPathConstrained(startRoomId int, constraints PathConstraints, endRoomId ...int) ([]pathStep, error) {
+
+	start := time.Now()
+	defer func() {
+		util.TrackTime(`mapper.GetPathConstrained()`, time.Since(start).Seconds())
+	}()
+
+	if len(endRoomId) == 0 {
+		return []pathStep{}, fmt.Errorf("%d => %d (endRoom not found): %w", startRoomId, endRoomId, ErrPathNotFound)
+	}
+
+	startRoom := rooms.LoadRoom(startRoomId)
+	if startRoom == nil {
+		return []pathStep{}, fmt.Errorf("%d => %d (startRoom  not found): %w", startRoomId, endRoomId, ErrPathNotFound)
+	}
+
+	m := GetMapper(startRoom.RoomId)
+	if m == nil {
+		return []pathStep{}, fmt.Errorf("%d => %d (mapper not fond): %w", startRoomId, endRoomId, ErrPathNotFound)
+	}
+
+	return getPath(m, startRoomId, &constraints, endRoomId...)
+}
+
+// getPath walks each destination leg in order through m. When constraints is
+// nil the per-leg results are memoized in pathCache; constrained queries skip
+// the cache entirely.
+func getPath(m *mapper, startRoomId int, constraints *PathConstraints, endRoomId ...int) ([]pathStep, error) {
+
+	useCache := constraints == nil
+
 	cacheKey := pathCacheKey{}
 	rNow := startRoomId
 	finalPath := []pathStep{}
@@ -223,37 +365,45 @@ func GetPath(startRoomId int, endRoomId ...int) ([]pathStep, error) {
 			continue
 		}
 
-		cacheKey.startRoomId = rNow
-		cacheKey.endRoomId = roomId
+		if useCache {
+			cacheKey.startRoomId = rNow
+			cacheKey.endRoomId = roomId
 
-		if pCache, ok := pathCache.Get(cacheKey); ok {
-			pathCacheHits.Add(1)
+			if pCache, ok := pathCache.Get(cacheKey); ok {
+				pathCacheHits.Add(1)
 
-			if pCache.err != nil {
-				return pCache.steps, fmt.Errorf("%d => %d: %w", rNow, roomId, pCache.err)
+				if pCache.err != nil {
+					return pCache.steps, fmt.Errorf("%d => %d: %w", rNow, roomId, pCache.err)
+				}
+
+				finalPath = append(finalPath, pCache.steps...)
+				rNow = roomId
+				continue
 			}
 
-			finalPath = append(finalPath, pCache.steps...)
-			rNow = roomId
-			continue
+			pathCacheMisses.Add(1)
 		}
-
-		pathCacheMisses.Add(1)
 
 		if !m.HasRoom(roomId) {
 			err := fmt.Errorf("%d => %d (room not in mapper): %w", rNow, roomId, ErrPathNotFound)
-			pathCache.Add(cacheKey, pathCacheValue{steps: nil, err: err})
+			if useCache {
+				pathCache.Add(cacheKey, pathCacheValue{steps: nil, err: err})
+			}
 			return []pathStep{}, err
 		}
 
-		p, err := m.findPath(rNow, roomId)
+		p, err := m.findPathConstrained(rNow, roomId, constraints)
 		if err != nil {
-			pathCache.Add(cacheKey, pathCacheValue{steps: p, err: err})
-			return []pathStep{}, fmt.Errorf("%d => %d: %w", rNow, roomId, ErrPathNotFound)
+			if useCache {
+				pathCache.Add(cacheKey, pathCacheValue{steps: p, err: err})
+			}
+			return []pathStep{}, fmt.Errorf("%d => %d: %w", rNow, roomId, err)
 		}
 
-		// Add to LRU cache
-		pathCache.Add(cacheKey, pathCacheValue{steps: p, err: nil})
+		if useCache {
+			// Add to LRU cache
+			pathCache.Add(cacheKey, pathCacheValue{steps: p, err: nil})
+		}
 
 		finalPath = append(finalPath, p...)
 		rNow = roomId
